@@ -44,6 +44,13 @@ def load_spherex_fits(filepath):
             hdul["VARIANCE"].data, dtype=np.float32
         ).copy()
 
+        if "ZODI" in hdul:
+            zodi = np.asarray(
+                hdul["ZODI"].data, dtype=np.float32
+            ).copy()
+        else:
+            zodi = np.zeros_like(image)
+
         # IMAGE header: celestial coordinates and metadata
         header = hdul["IMAGE"].header.copy()
 
@@ -85,6 +92,8 @@ def load_spherex_fits(filepath):
         "flags": flags,
         "flags_header": flags_header,  # NEW
         "variance": variance,
+        "zodi": zodi,
+        "science_image": image - zodi,
         "wcs": wcs,
         "wavelength_grid": wavelength_grid,
         "wave_x": wave_x,

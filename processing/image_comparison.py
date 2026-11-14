@@ -20,8 +20,9 @@ def compare_images(data1, data2, wavelength_tolerance=0.005):
     It is a provisional analysis threshold.
     """
 
-    image1 = data1["image"]
-    image2 = data2["image"]
+    # Use zodiacal-light-subtracted images when fits_loader provides them.
+    image1 = data1.get("science_image", data1["image"])
+    image2 = data2.get("science_image", data2["image"])
 
     variance1 = data1["variance"]
     variance2 = data2["variance"]

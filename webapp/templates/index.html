@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SPHEREx Sky Time-Lapse</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261114-12') }}">
+</head>
+<body>
+  <main class="page">
+    <header>
+      <p class="eyebrow">NASA SPHEREx · Hackathon prototype</p>
+      <h1>Sky Time-Lapse Viewer</h1>
+      <p class="intro">Explore every current DR1 + QR3 observation at a selected sky position, then compare meaningful changes through time.</p>
+    </header>
+
+    <section class="panel sky-picker" data-sky-picker data-tile-url="{{ url_for('all_sky_tile_api') }}" data-hips-url="https://irsa.ipac.caltech.edu/data/hips/SPHEREx/spherex_allsky_cube">
+      <div class="section-heading">
+        <div><p class="step">Step 1</p><h2>Select a sky position</h2></div>
+        <p>Scroll to zoom · drag to move · click to select</p>
+      </div>
+      <div class="sky-viewport all-sky-map" data-sky-viewport>
+        <div id="spherex-all-sky" class="aladin-map" data-aladin-map></div>
+        <div class="sky-layer" data-sky-layer hidden>
+          <img src="{{ url_for('static', filename='vendor/spherex/allsky-channel-1.png', v='dr1') }}" alt="SPHEREx DR1 full-sky HEALPix tile atlas" draggable="false" data-sky-image>
+          <div class="selection-box" data-selection-box aria-hidden="true"></div>
+        </div>
+        <div class="map-badge">SPHEREx DR1 · complete HEALPix sky atlas · channel 1/102</div>
+        <div class="map-help" data-map-help>Click a sky tile to select it</div>
+      </div>
+      <div class="map-actions">
+        <button type="button" class="secondary" data-zoom-out aria-label="Zoom out">−</button>
+        <button type="button" class="secondary" data-reset-view>Reset view</button>
+        <button type="button" class="secondary" data-zoom-in aria-label="Zoom in">+</button>
+        <label class="channel-control">Spectral channel
+          <select data-sky-channel data-channel-url="/all-sky/channel/{channel}.png"></select>
+        </label>
+      </div>
+      <p class="map-fallback">The normal view is a continuous 360° Aitoff map. The 768-tile technical atlas is used only as a fallback when WebGL2 is unavailable.</p>
+    </section>
+
+    <section class="panel form-panel">
+      <div class="section-heading">
+        <div><p class="step">Step 2</p><h2>Choose the comparison</h2></div>
+        <p class="time-gap"><strong>Latest IRSA releases</strong> · DR1 + current QR3 observations</p>
+      </div>
+      <form action="{{ url_for('generate') }}" method="post" class="controls" data-archive-form data-observations-url="{{ url_for('observations_api') }}">
+        <label>Right Ascension (°)
+          <input name="ra" data-ra-input type="number" min="0" max="359.999999" step="any" required value="{{ values.ra }}">
+        </label>
+        <label>Declination (°)
+          <input name="dec" data-dec-input type="number" min="-90" max="90" step="any" required value="{{ values.dec }}">
+        </label>
+        <label>Cutout size (pixels)
+          <input name="size" type="number" min="16" max="1024" step="1" required value="{{ values.size }}">
+        </label>
+        <label>Spectral band
+          <select name="band" data-band-input>
+            {% for band in bands %}<option value="{{ band }}"{% if values.band|default('SPHEREx-D5') == band %} selected{% endif %}>{{ band }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Quick period
+          <select data-period-input>
+            <option value="all" selected>All available data</option>
+            <option value="1">Last day</option>
+            <option value="7">Last week</option>
+            <option value="30">Last month</option>
+            <option value="90">Last 3 months</option>
+            <option value="365">Last year</option>
+            <option value="custom">Custom dates</option>
+          </select>
+        </label>
+        <label>Period from
+          <input name="from_date" data-from-date type="date">
+        </label>
+        <label>Period to
+          <input name="to_date" data-to-date type="date">
+        </label>
+        <button type="button" data-search-observations>Find current data</button>
+        <div class="archive-status" data-archive-status>Select a sky position, then search the live IRSA archive.</div>
+        <label>From observation
+          <select name="start_id" data-start-date required disabled><option value="">Search first</option></select>
+        </label>
+        <label>To observation
+          <select name="end_id" data-end-date required disabled><option value="">Search first</option></select>
+        </label>
+        <label>Maximum animation frames
+          <select name="max_frames">
+            {% for count in (2, 6, 12, 24) %}<option value="{{ count }}"{% if count == 6 %} selected{% endif %}>{{ count }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Candidate threshold: <strong data-sigma-value>5.0σ</strong>
+          <input name="sigma_threshold" data-sigma-threshold type="range" min="3" max="10" step="0.5" value="5">
+        </label>
+        <button type="submit" data-generate disabled>Generate time-lapse</button>
+        <div class="range-note">The observation selectors show every matching result (up to 5,000). For speed and reliability, the animation downloads only the selected number of evenly spaced frames.</div>
+      </form>
+      <p class="hint">Try the dataset center: RA 133.805°, Dec −8.770°, size 128.</p>
+      {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+    </section>
+
+    {% if result %}
+    <section class="viewer" data-viewer>
+      <div class="image-stage">
+        {% for observation in result.observations %}
+        <img
+          class="frame{% if loop.first %} active{% endif %}"
+          src="{{ url_for('output_file', job_id=job_id, filename=observation.frame) }}"
+          alt="SPHEREx observation from {{ observation.date[:10] }}"
+          data-date="{{ observation.date[:10] }}"
+        >
+        {% endfor %}
+      </div>
+
+      <div class="transport" aria-label="Animation controls">
+        <button type="button" data-action="previous">Previous</button>
+        <button type="button" data-action="play">Play</button>
+        <button type="button" data-action="pause">Pause</button>
+        <button type="button" data-action="next">Next</button>
+      </div>
+
+      <div class="timeline" aria-label="Observation timeline">
+        {% for observation in result.observations %}
+        <button type="button" class="timeline-point{% if loop.first %} active{% endif %}" data-index="{{ loop.index0 }}">
+          <span></span>{{ observation.date[:10] }}
+        </button>
+        {% endfor %}
+      </div>
+
+      <div class="details">
+        <p><strong id="current-date">{{ result.observations[0].date[:10] }}</strong></p>
+        <p>RA {{ '%.6f'|format(result.ra) }}° · Dec {{ '%.6f'|format(result.dec) }}° · {{ result.size_pixels }} px · {{ result.band }}</p>
+        <p>{{ result.selected_count }} frames selected from {{ result.available_count }} matching archive observations.</p>
+        {% if result.skipped_count %}
+        <p class="skip-notice">{{ result.skipped_count }} unavailable frame{% if result.skipped_count != 1 %}s were{% else %} was{% endif %} skipped automatically.</p>
+        {% endif %}
+      </div>
+
+      {% if result.scientific %}
+      <div class="scientific-card">
+        <div class="section-heading">
+          <div><p class="step">Scientific validation</p><h2>Corrected comparison</h2></div>
+          <p>{{ '%.1f'|format(result.scientific.valid_percentage) }}% valid pixels · Δλ median {{ '%.6f'|format(result.scientific.median_wavelength_difference_um) }} μm</p>
+        </div>
+        <img src="{{ url_for('output_file', job_id=job_id, filename=result.scientific.figure) }}" alt="Scientific comparison with aligned images, difference and significance">
+        <div class="science-metrics">
+          <span><strong>{{ result.scientific.valid_pixels }}</strong> valid pixels</span>
+          <span><strong>{{ result.scientific.significant_pixels_abs_gt_5 }}</strong> pixels above |5σ|</span>
+          <span><strong>{{ '%.6f'|format(result.scientific.background_offset_mjy_sr) }}</strong> MJy/sr background offset</span>
+          <span><strong>{{ result.scientific.candidate_count }}</strong> candidate peaks ≥ {{ result.scientific.sigma_threshold }}σ</span>
+          <span><strong>{{ result.scientific.motion_pair_count }}</strong> preliminary motion pairs</span>
+        </div>
+        <img class="candidate-overview" src="{{ url_for('output_file', job_id=job_id, filename=result.scientific.candidate_overview) }}" alt="Detected positive and negative residual candidates">
+        {% if result.scientific.motion_figure %}
+        <img class="candidate-overview" src="{{ url_for('output_file', job_id=job_id, filename=result.scientific.motion_figure) }}" alt="Preliminary motion hypotheses">
+        {% endif %}
+      </div>
+
+      {% if result.scientific.candidates %}
+      <section class="candidate-section">
+        <div class="section-heading">
+          <div><p class="step">Candidate review</p><h2>Strongest meaningful changes</h2></div>
+          <p>Hypotheses for inspection—not confirmed objects.</p>
+        </div>
+        <div class="candidate-grid">
+          {% for candidate in result.scientific.candidates %}
+          <article class="candidate-card">
+            <img src="{{ url_for('output_file', job_id=job_id, filename=candidate.figure) }}" alt="Candidate {{ candidate.rank }} cutout comparison">
+            <div>
+              <h3>Candidate {{ candidate.rank }}</h3>
+              <p class="candidate-class">{{ candidate.classification|replace('_', ' ') }}</p>
+              <dl>
+                <dt>RA / Dec</dt><dd>{{ '%.6f'|format(candidate.ra) }}° / {{ '%.6f'|format(candidate.dec) }}°</dd>
+                <dt>Local score</dt><dd>{{ '%.2f'|format(candidate.score) }}σ</dd>
+                <dt>Variance significance</dt><dd>{{ '%.2f'|format(candidate.propagated_significance) }}σ</dd>
+                <dt>Quality</dt><dd>{{ candidate.quality_flag|replace('_', ' ') }}</dd>
+              </dl>
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+
+      <details class="terminal-panel" open>
+        <summary>Analysis terminal</summary>
+        <pre>{{ result.terminal_output }}</pre>
+      </details>
+      {% endif %}
+
+      <div class="gif-card">
+        <div>
+          <h2>Generated GIF</h2>
+          <p>Two aligned observations with a shared brightness scale.</p>
+          <a class="download" href="{{ url_for('output_file', job_id=job_id, filename=result.gif) }}" download>Download GIF</a>
+        </div>
+        <img src="{{ url_for('output_file', job_id=job_id, filename=result.gif) }}" alt="Animated SPHEREx comparison">
+      </div>
+    </section>
+    {% endif %}
+  </main>
+  <script type="module">
+    import A from "{{ url_for('static', filename='vendor/aladin/aladin.js', v='3.8.2') }}";
+    window.A = A;
+    window.dispatchEvent(new Event("aladin-ready"));
+  </script>
+  <script src="{{ url_for('static', filename='viewer.js', v='20261114-13') }}"></script>
+</body>
+</html>

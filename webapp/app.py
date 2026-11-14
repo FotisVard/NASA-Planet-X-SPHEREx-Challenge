@@ -1,0 +1,352 @@
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+from io import StringIO
+import os
+import sys
+import threading
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from astropy.time import Time
+from astropy import units as u
+from astropy_healpix import HEALPix
+from uuid import uuid4
+
+from flask import Flask, abort, jsonify, render_template, request, send_file, send_from_directory
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+PROCESSING_DIR = BASE_DIR / "processing"
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+if str(PROCESSING_DIR) not in sys.path:
+    sys.path.insert(0, str(PROCESSING_DIR))
+
+from processing.sky_cutout import (  # noqa: E402
+    create_sky_preview,
+    generate_cutouts,
+    preview_pixel_to_sky,
+)
+from processing.spherex_archive import (  # noqa: E402
+    ArchiveError,
+    BANDS,
+    download_cutout,
+    search_observations,
+    select_time_range,
+)
+from scientific_comparison import run_scientific_comparison  # noqa: E402
+
+
+OUTPUT_ROOT = BASE_DIR / "data" / "processed" / "web_viewer"
+ARCHIVE_CACHE = BASE_DIR / "data" / "cache" / "spherex_cutouts"
+SEARCH_CACHE_TTL = 10 * 60
+_search_cache = {}
+_search_cache_lock = threading.Lock()
+ALL_SKY_ORDER = 3
+ALL_SKY_COLUMNS = 27
+ALL_SKY_ROWS = 29
+ALL_SKY_TILE_COUNT = 12 * (4 ** ALL_SKY_ORDER)
+_all_sky_healpix = HEALPix(nside=2 ** ALL_SKY_ORDER, order="nested", frame="icrs")
+ALL_SKY_HIPS_ROOT = "https://irsa.ipac.caltech.edu/data/hips/SPHEREx/spherex_allsky_cube"
+
+
+def cached_observation_search(ra, dec, band, from_date=None, to_date=None):
+    start_mjd = float(Time(from_date).mjd) if from_date else None
+    # Include the complete To date by querying up to the following midnight.
+    end_mjd = float(Time(to_date).mjd) + 1 if to_date else None
+    key = (
+        round(float(ra), 6), round(float(dec), 6), str(band),
+        from_date or "", to_date or "",
+    )
+    now = time.monotonic()
+    with _search_cache_lock:
+        cached = _search_cache.get(key)
+        if cached and now - cached[0] < SEARCH_CACHE_TTL:
+            return cached[1], True
+    observations = search_observations(
+        ra, dec, band, start_mjd=start_mjd, end_mjd=end_mjd
+    )
+    with _search_cache_lock:
+        _search_cache[key] = (now, observations)
+    return observations, False
+
+
+def create_app(test_config=None):
+    app = Flask(__name__)
+    app.config.from_mapping(
+        OUTPUT_ROOT=OUTPUT_ROOT,
+        ARCHIVE_CACHE=ARCHIVE_CACHE,
+        MAX_CONTENT_LENGTH=16 * 1024,
+    )
+    if test_config:
+        app.config.update(test_config)
+
+    @app.after_request
+    def disable_browser_cache(response):
+        if response.mimetype in {"text/html", "text/css", "application/javascript"}:
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+    @app.get("/")
+    def index():
+        return render_template(
+            "index.html",
+            values={"ra": "133.805", "dec": "-8.770", "size": "128"},
+            bands=BANDS,
+        )
+
+    @app.get("/latest-sky-preview.png")
+    def latest_sky_preview():
+        preview_path = Path(app.config["OUTPUT_ROOT"]) / "latest_sky_preview.png"
+        if not preview_path.is_file():
+            create_sky_preview(preview_path)
+        return send_file(preview_path, mimetype="image/png", max_age=0)
+
+    @app.get("/api/preview-pixel-to-sky")
+    def preview_pixel_to_sky_api():
+        try:
+            ra, dec = preview_pixel_to_sky(
+                request.args["x"],
+                request.args["y"],
+                request.args["width"],
+                request.args["height"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc) or "Invalid preview coordinates."), 400
+        except (FileNotFoundError, RuntimeError) as exc:
+            return jsonify(error=str(exc)), 422
+        return jsonify(ra=ra, dec=dec)
+
+    @app.get("/api/all-sky-tile")
+    def all_sky_tile_api():
+        """Map a click in the official HiPS Allsky atlas to a HEALPix tile."""
+        try:
+            x = float(request.args["x"])
+            y = float(request.args["y"])
+            width = float(request.args["width"])
+            height = float(request.args["height"])
+            if width <= 0 or height <= 0 or not (0 <= x < width and 0 <= y < height):
+                raise ValueError("The selected point is outside the all-sky atlas.")
+            column = min(ALL_SKY_COLUMNS - 1, int(x / width * ALL_SKY_COLUMNS))
+            row = min(ALL_SKY_ROWS - 1, int(y / height * ALL_SKY_ROWS))
+            tile = row * ALL_SKY_COLUMNS + column
+            if tile >= ALL_SKY_TILE_COUNT:
+                raise ValueError("Select a tile containing SPHEREx sky data.")
+            lon, lat = _all_sky_healpix.healpix_to_lonlat(tile)
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc) or "Invalid all-sky selection."), 400
+        return jsonify(
+            tile=tile,
+            order=ALL_SKY_ORDER,
+            ra=float(lon.to_value(u.deg) % 360),
+            dec=float(lat.to_value(u.deg)),
+        )
+
+    @app.get("/all-sky/channel/<int:channel>.png")
+    def all_sky_channel(channel):
+        """Cache and serve one lightweight overview frame of the 102-plane cube."""
+        if not 1 <= channel <= 102:
+            abort(404)
+        if channel == 1:
+            return send_from_directory(
+                BASE_DIR / "webapp" / "static" / "vendor" / "spherex",
+                "allsky-channel-1.png",
+                max_age=86400,
+            )
+        cache_dir = Path(app.config["ARCHIVE_CACHE"]) / "all_sky_channels"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"channel-{channel}.png"
+        if not target.is_file() or target.stat().st_size < 1024:
+            url = f"{ALL_SKY_HIPS_ROOT}/Norder3/Allsky_{channel - 1}.png"
+            temporary = target.with_suffix(".part")
+            try:
+                req = Request(url, headers={"User-Agent": "NasaPlanetX/1.0"})
+                with urlopen(req, timeout=45) as response, temporary.open("wb") as output:
+                    while chunk := response.read(1024 * 1024):
+                        output.write(chunk)
+                if temporary.stat().st_size < 1024:
+                    raise RuntimeError("IRSA returned an empty all-sky frame.")
+                temporary.replace(target)
+            except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
+                temporary.unlink(missing_ok=True)
+                app.logger.warning("All-sky channel %s unavailable: %s", channel, exc)
+                return jsonify(error=f"Channel {channel} is temporarily unavailable."), 502
+        return send_file(target, mimetype="image/png", max_age=86400)
+
+    @app.get("/api/observations")
+    def observations_api():
+        try:
+            ra = float(request.args["ra"])
+            dec = float(request.args["dec"])
+            band = request.args.get("band", "SPHEREx-D5")
+            from_date = request.args.get("from_date", "")
+            to_date = request.args.get("to_date", "")
+            if bool(from_date) != bool(to_date):
+                raise ValueError("Choose both From and To, or leave both empty for all data.")
+            if from_date and from_date > to_date:
+                raise ValueError("Choose a valid From/To date period.")
+            observations, cache_hit = cached_observation_search(
+                ra, dec, band, from_date, to_date
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return jsonify(error=str(exc) or "Invalid archive search."), 400
+        except ArchiveError as exc:
+            return jsonify(error=str(exc)), 502
+        return jsonify(
+            observations=observations,
+            count=len(observations),
+            truncated=len(observations) == 5000,
+            cache_hit=cache_hit,
+        )
+
+    @app.post("/generate")
+    def generate():
+        values = {
+            "ra": request.form.get("ra", "").strip(),
+            "dec": request.form.get("dec", "").strip(),
+            "size": request.form.get("size", "").strip(),
+            "band": request.form.get("band", "SPHEREx-D5").strip(),
+            "start_id": request.form.get("start_id", "").strip(),
+            "end_id": request.form.get("end_id", "").strip(),
+            "max_frames": request.form.get("max_frames", "12").strip(),
+            "from_date": request.form.get("from_date", "").strip(),
+            "to_date": request.form.get("to_date", "").strip(),
+            "sigma_threshold": request.form.get("sigma_threshold", "5").strip(),
+        }
+
+        try:
+            ra = float(values["ra"])
+            dec = float(values["dec"])
+            size = int(values["size"])
+            sigma_threshold = float(values["sigma_threshold"])
+            if not 3 <= sigma_threshold <= 10:
+                raise ValueError("Sigma threshold must be between 3 and 10.")
+        except (TypeError, ValueError):
+            return render_template(
+                "index.html",
+                values=values,
+                bands=BANDS,
+                error="Enter numeric RA/Dec values and a whole-number cutout size.",
+            ), 400
+
+        try:
+            available, search_cache_hit = cached_observation_search(
+                ra, dec, values["band"], values["from_date"], values["to_date"]
+            )
+            if not available:
+                raise RuntimeError("No current IRSA observations cover this position and band.")
+            start_id = values["start_id"] or available[0]["id"]
+            end_id = values["end_id"] or available[-1]["id"]
+            selected = select_time_range(
+                available, start_id, end_id, int(values["max_frames"])
+            )
+            job_id = uuid4().hex
+            job_dir = Path(app.config["OUTPUT_ROOT"]) / job_id
+            def fetch_cutout(observation):
+                try:
+                    return download_cutout(
+                        observation,
+                        ra,
+                        dec,
+                        size,
+                        app.config["ARCHIVE_CACHE"],
+                        max_attempts=2,
+                    )
+                except ArchiveError as exc:
+                    return exc
+
+            with ThreadPoolExecutor(max_workers=min(3, len(selected))) as executor:
+                download_results = list(executor.map(fetch_cutout, selected))
+
+            cutout_files = []
+            usable_observations = []
+            skipped_observations = []
+            for observation, download_result in zip(selected, download_results):
+                if isinstance(download_result, Exception):
+                    app.logger.warning("Skipping unavailable cutout: %s", download_result)
+                    skipped_observations.append({
+                        "date": observation["date"],
+                        "filename": observation["filename"],
+                        "reason": str(download_result),
+                    })
+                    continue
+                cutout_files.append(download_result)
+                usable_observations.append(observation)
+
+            if len(cutout_files) < 2:
+                raise RuntimeError(
+                    "Fewer than two observations could be downloaded. "
+                    "IRSA may be temporarily busy; try a smaller date range shortly."
+                )
+            metadata = generate_cutouts(
+                ra,
+                dec,
+                size,
+                job_dir,
+                files=cutout_files,
+                archive_metadata=usable_observations,
+            )
+            metadata["available_count"] = len(available)
+            metadata["selected_count"] = len(usable_observations)
+            metadata["requested_count"] = len(selected)
+            metadata["skipped_count"] = len(skipped_observations)
+            metadata["skipped_observations"] = skipped_observations
+            metadata["band"] = values["band"]
+            metadata["search_cache_hit"] = search_cache_hit
+            terminal_buffer = StringIO()
+            with redirect_stdout(terminal_buffer):
+                scientific = run_scientific_comparison(
+                    cutout_files[0],
+                    cutout_files[-1],
+                    job_dir,
+                    sigma_threshold=sigma_threshold,
+                )
+            metadata["scientific"] = scientific
+            metadata["terminal_output"] = terminal_buffer.getvalue()
+        except ValueError as exc:
+            return render_template(
+                "index.html", values=values, bands=BANDS, error=str(exc)
+            ), 400
+        except (ArchiveError, FileNotFoundError, RuntimeError) as exc:
+            app.logger.warning("Cutout generation failed: %s", exc)
+            return render_template(
+                "index.html", values=values, bands=BANDS, error=str(exc)
+            ), 422
+        except Exception:
+            app.logger.exception("Unexpected cutout generation error")
+            return render_template(
+                "index.html",
+                values=values,
+                bands=BANDS,
+                error="The cutout could not be generated. Check the server log.",
+            ), 500
+
+        return render_template(
+            "index.html", values=values, bands=BANDS, result=metadata, job_id=job_id
+        )
+
+    @app.get("/outputs/<job_id>/<path:filename>")
+    def output_file(job_id, filename):
+        if len(job_id) != 32 or any(c not in "0123456789abcdef" for c in job_id):
+            abort(404)
+        return send_from_directory(
+            Path(app.config["OUTPUT_ROOT"]) / job_id, filename
+        )
+
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    app.run(
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+        use_reloader=False,
+        threaded=True,
+        host="127.0.0.1",
+        port=int(os.environ.get("PORT", "5050")),
+    )
